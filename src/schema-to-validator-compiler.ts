@@ -1,8 +1,30 @@
+import { unionToTuple } from "@arktype/util";
 import { AST } from "@effect/schema";
 import * as Schema from "@effect/schema/Schema";
-import type { PropertyValidators, Validator } from "convex/values";
+import type {
+  GenericId,
+  OptionalProperty,
+  PropertyValidators,
+  Validator,
+  VArray,
+  VBoolean,
+  VBytes,
+  VFloat64,
+  VId,
+  VInt64,
+  VLiteral,
+  VNull,
+  VObject,
+  VOptional,
+  VString,
+  VUnion,
+} from "convex/values";
 import { v, Value } from "convex/values";
 import { Array, Data, Effect, Match, Option, pipe } from "effect";
+import { ReadonlyRecord } from "effect/Record";
+import { DeepMutable } from "effect/Types";
+
+import { IsUnion } from "~/src/type-utils";
 
 // Args
 
@@ -27,10 +49,12 @@ const goTopArgs = (ast: AST.AST): PropertyValidators =>
 
 export const table = <DatabaseValue, TypeScriptValue = DatabaseValue>(
   schema: Schema.Schema<TypeScriptValue, DatabaseValue>
-): Validator<Record<string, any>, false, any> =>
+): Validator<Record<string, any>, "required", any> =>
   goTopTable(Schema.encodedSchema(schema).ast);
 
-const goTopTable = (ast: AST.AST): Validator<Record<string, any>, false, any> =>
+const goTopTable = (
+  ast: AST.AST
+): Validator<Record<string, any>, "required", any> =>
   pipe(
     ast,
     Match.value,
@@ -44,6 +68,137 @@ const goTopTable = (ast: AST.AST): Validator<Record<string, any>, false, any> =>
   );
 
 // Compiler
+
+type ReadonlyOrMutableValue =
+  | Value
+  | ReadonlyArray<Value>
+  | { readonly [key: string]: Value | undefined };
+
+type ReadonlyOrMutableArray<T> = ReadonlyArray<T> | Array<T>;
+
+type ReadonlyOrMutableRecord<T> = ReadonlyRecord<string, T> | Record<string, T>;
+
+export type ValueToValidator<Vl extends ReadonlyOrMutableValue> = [Vl] extends [
+  never,
+]
+  ? never
+  : [Vl] extends [ReadonlyOrMutableValue]
+    ? Vl extends {
+        __tableName: infer TableName extends string;
+      }
+      ? VId<GenericId<TableName>>
+      : IsValueLiteral<Vl> extends true
+        ? VLiteral<Vl>
+        : Vl extends null
+          ? VNull<null>
+          : Vl extends number
+            ? VFloat64<number>
+            : Vl extends bigint
+              ? VInt64<bigint>
+              : Vl extends boolean
+                ? VBoolean<boolean>
+                : Vl extends string
+                  ? VString<string>
+                  : Vl extends ArrayBuffer
+                    ? VBytes<ArrayBuffer>
+                    : Vl extends ReadonlyOrMutableArray<ReadonlyOrMutableValue>
+                      ? ArrayValueToValidator<Vl>
+                      : Vl extends ReadonlyOrMutableRecord<ReadonlyOrMutableValue>
+                        ? RecordValueToValidator<Vl>
+                        : IsUnion<Vl> extends true
+                          ? UnionValueToValidator<Vl>
+                          : never
+    : never;
+
+type ArrayValueToValidator<
+  Vl extends ReadonlyOrMutableArray<ReadonlyOrMutableValue>,
+> =
+  Vl extends ReadonlyOrMutableArray<infer El extends ReadonlyOrMutableValue>
+    ? ValueToValidator<El> extends infer Vd extends Validator<any, any, any>
+      ? VArray<DeepMutable<El[]>, Vd>
+      : never
+    : never;
+
+type RecordValueToValidator<
+  Vl extends ReadonlyOrMutableRecord<ReadonlyOrMutableValue>,
+> = {
+  -readonly [K in keyof Vl]-?: UndefinedOrValueToValidator<Vl[K]>;
+} extends infer VdRecord extends Record<string, any>
+  ? {
+      -readonly [K in keyof Vl]: DeepMutable<Vl[K]>;
+    } extends infer VlRecord extends Record<string, any>
+    ? VObject<VlRecord, VdRecord>
+    : never
+  : never;
+
+export type UndefinedOrValueToValidator<
+  Vl extends ReadonlyOrMutableValue | undefined,
+> = undefined extends Vl
+  ? [Vl] extends [(infer Val extends ReadonlyOrMutableValue) | undefined]
+    ? ValueToValidator<Val> extends infer Vd extends Validator<
+        any,
+        OptionalProperty,
+        any
+      >
+      ? VOptional<Vd>
+      : never
+    : never
+  : Vl extends ReadonlyOrMutableValue
+    ? ValueToValidator<Vl>
+    : never;
+
+type UnionValueToValidator<Vl extends ReadonlyOrMutableValue> = [Vl] extends [
+  ReadonlyOrMutableValue,
+]
+  ? IsUnion<Vl> extends true
+    ? unionToTuple<Vl> extends infer VlTuple extends
+        ReadonlyOrMutableArray<ReadonlyOrMutableValue>
+      ? ValueTupleToValidatorTuple<VlTuple> extends infer VdTuple extends
+          Validator<any, "required", any>[]
+        ? VUnion<DeepMutable<Vl>, VdTuple>
+        : never
+      : never
+    : never
+  : never;
+
+type ValueTupleToValidatorTuple<
+  VlTuple extends ReadonlyOrMutableArray<ReadonlyOrMutableValue>,
+> = VlTuple extends [
+  infer Vl extends ReadonlyOrMutableValue,
+  ...infer VlRest extends ReadonlyOrMutableArray<ReadonlyOrMutableValue>,
+]
+  ? ValueToValidator<Vl> extends infer Vd extends Validator<any, any, any>
+    ? ValueTupleToValidatorTuple<VlRest> extends infer VdRest extends Validator<
+        any,
+        "required",
+        any
+      >[]
+      ? [Vd, ...VdRest]
+      : never
+    : never
+  : [];
+
+// https://stackoverflow.com/a/52806744
+type IsValueLiteral<Vl extends ReadonlyOrMutableValue> = [Vl] extends [never]
+  ? never
+  : [Vl] extends [string | number | bigint | boolean]
+    ? [string] extends [Vl]
+      ? false
+      : [number] extends [Vl]
+        ? false
+        : [boolean] extends [Vl]
+          ? false
+          : [bigint] extends [Vl]
+            ? false
+            : true
+    : false;
+
+export const compileSchema = <A extends ReadonlyOrMutableValue>(
+  schema: Schema.Schema<A>
+) =>
+  compile(schema.ast) as unknown as ValueToValidator<
+    Schema.Schema.Encoded<typeof schema>
+  >;
 
 export const compile = (ast: AST.AST): Validator<any, any, any> =>
   pipe(
@@ -190,8 +345,6 @@ const handlePropertySignatures = (
       )
     )
   );
-
-export type Compile<V extends Value> = Validator<V, any, any>;
 
 // Errors
 
